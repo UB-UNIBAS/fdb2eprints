@@ -1,4 +1,4 @@
-from .transformation_utilities import *
+from transformation_utilities import *
 import logging
 
 """A list of all possible status of the projects. Any status not covered will be assumed as False."""

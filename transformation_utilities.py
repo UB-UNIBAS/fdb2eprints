@@ -38,6 +38,22 @@ class TransformFDBRecord(collections.Sequence):
         self.current_id = ''
         self.current_title = ''
         self.current_type = ''
+        self.current_subtype = ''
+
+
+        self.publication_types = {
+            'Publication: JournalArticle (Originalarbeit in einer wissenschaftlichen Zeitschrift)': 'article',
+            'JournalItem (Kommentare, Editorials, Rezensionen, Urteilsanmerk., etc. in einer wissnsch. Zeitschr.': 'article',
+            'Publication: Book Item (Buchkap., Lexikonartikel, jur. Kommentierung, Beiträge in Sammelbänden etc.': 'book_section',
+            'Publication: ConferencePaper (Artikel, die in Tagungsbänder erschienen sind)': 'conference_item',
+            'Publication: Edited Book (Herausgeber eines eigenständigen Buches)': 'book',
+            'Publication: Authored Book (Verfasser eines eigenständigen Buches)': 'book',
+            'Publication: NewsItemPrint (Artikel in einer Tages, Wochen- oder Monatszeitschrift)': 'contribution_to_periodical',
+            'Publication: Other Publications (Forschungsberichte o.ä.)': 'other',
+            'Publication: Discussion paper / Internet publication': 'working_paper',
+            'Publication: NewsItemEmission (Radio - Fernsehbeiträge)': 'audio_visual',
+            'Publication: Thesis (Dissertationen, Habilitationen)': 'thesis'
+        }
 
     def harvest(self, use_last_update=False):
         harvester = HarvestFDBData(user=config['fdb-harvest']['user'],
@@ -72,7 +88,7 @@ class TransformFDBRecord(collections.Sequence):
         return len(files)
 
     def __getitem__(self, item):
-        logging.debug("Remove namespace tags.")
+        logging.debug('Remove all namespace tags from XML elements for better processing.')
         # uses the encoding specified inside of the xml.
         tree = ET.iterparse(self.file_names[item])
         # Remove namespaces as they are not properly supported in xmljson and would clutter the field names in ES.
@@ -81,7 +97,7 @@ class TransformFDBRecord(collections.Sequence):
                 element.tag = element.tag.split('}', 1)[1]
             except IndexError:
                 pass
-        logging.debug("Removed all namespace tags.")
+        logging.debug('Successfully removed all namespace tags from XML elements.')
         return tree.root.find('./ListRecords')
 
     def filter_record(self, record):
@@ -107,6 +123,8 @@ class TransformFDBRecord(collections.Sequence):
                         self.current_id = element.text
                     elif element.tag == 'type':
                         self.current_type = element.text
+                    elif element.tag == 'pubtype_weboffice':
+                        self.current_subtype = element.text
                 for element in fields:
                     if element.tag in self.functions:
                         self.functions[element.tag][0](element, c, **self.functions[element.tag][1])
@@ -360,6 +378,152 @@ class TransformFDBRecord(collections.Sequence):
             field = ET.SubElement(parent, edoc_tag)
         item = ET.SubElement(field, 'item')
         ET.SubElement(item, 'name').text = element.text.strip()
+
+    def transform_web_appearance(self, element, parent, edoc_tag):
+        """Add hide_on_weblist if easyWeb_appearance = "Do not show on easyWeb-Pages"."""
+        if element.text == 'Do not show on easyWeb-Pages':
+            logging.info('%s is hidden on web page.', self.current_id)
+            ET.SubElement(parent, edoc_tag).text = 'TRUE'
+        else:
+            ET.SubElement(parent, edoc_tag).text = 'FALSE'
+
+    def transform_publication_title(self, element, parent, edoc_tag):
+        """Transforms the title of a publication.
+
+        Removes special signs, html stuff & a dot at the end if this is a pub-med import."""
+        if parent.find('./pubmedid'):
+            element.text = element.text.strip('.')
+        self.transform_html_text(element, parent, edoc_tag)
+
+    def transform_page_range(self, element, parent, edoc_tag):
+        """Transform publication page ranges.
+
+        Removes common prefixes & whitespaces.
+        Expands page range if second part is shortened."""
+        pages = element.text.strip()
+        pages = re.sub('^S\. ', '', pages)
+        pages = re.sub('^p\. ', '', pages)
+        if self.current_type in []
+        page_range = element.text
+        if page_range.count('-') == 1:
+            f, s = page_range.split('-')
+            try:
+                first_number = int(f)
+                second_number = int(s)
+            except ValueError:
+                pass
+            else:
+                new_second = ''
+                if second_number < first_number:
+                    for i in range(len(f) - len(s)):
+                        new_second += str(f[i])
+                    page_range = str(f) + '-' + new_second + str(s)
+
+        ET.SubElement(parent, edoc_tag).text = page_range
+
+    def transform_publication_type(self, element, parent, edoc_tag):
+        """Transform the publication type.
+
+        Creates the note as well.
+        """
+        self.create_note_from_type(element.text, parent)
+        value = element.text
+
+        if re.search('Authored Book|Edited Book', value):
+            element.text = 'book'
+        elif re.search('JournalArticle|JournalItem', value):
+            element.text = 'article'
+        elif re.search('Book Item', value):
+            element.text = 'book section'
+        elif re.search('ConferencePaper', value):
+            element.text = 'conference_item'
+        elif re.search('Thesis', value):
+            element.text = 'thesis'
+        # Note: Only discussion papers with the subtype internet publication become type preprint.
+        elif re.search('Discussion paper', value) and self.current_subtype == 'Internet publication':
+            element.text = 'preprint'
+        elif re.search('Discussion paper', value):
+            element.text = 'working_paper'
+        elif re.search('NewsItemPrint', value):
+            element.text = 'contribution_to_peridocal'
+        elif re.search('NewsItemEmission', value):
+            element.text = 'audio_visual'
+
+        self.transform_to_field(element, parent, edoc_tag)
+
+    def transform_pubtype_weboffice(self, element, parent, edoc_tag):
+        """
+        """
+
+        subtypes = {
+            'Review':'review',
+            'Rezension': 'book_review',
+            'Urteilsanmerkung': 'annotation',
+            'Aufsatz/Beitrag in Sammelband': 'chapter',
+            'Lexikonartikel': 'encyclopedia',
+            'Jur. Kommentierung': 'commentary',
+            'Übersetzung': 'contribution'
+        }
+
+        if element.text in subtypes:
+            text = subtypes[element.text]
+        elif element.text == 'Edition' and re.search('Editied Book', self.current_type):
+            text = 'contribution'
+        elif re.search('JournalArticle', self.current_type):
+            text = 'research'
+        elif re.search('JournalItem', self.current_type):
+            text = 'contribution'
+        elif re.search('Authored Book', self.current_type):
+            text = 'authored'
+        elif re.search('Edited Book', self.current_type):
+            text = 'edited'
+        elif self.publication_types[self.current_type] == 'book_section':
+            text = 'contribution'
+        elif re.search('ConferencePaper', self.current_type):
+            text = 'paper'
+        else:
+            text = ''
+            self.logger.error('Could not determine subtype of %s with type %s and subtype %s.', self.current_id,
+                              self.current_type, self.current_subtype)
+
+        ET.SubElement(parent, edoc_tag).text = text
+
+    @staticmethod
+    def create_note_from_type(value, parent):
+        """Generate the note from the RDB type."""
+        value = re.sub('Publication: ', 'Publication type according to Uni Basel Research Database: ', value)
+
+        value = re.sub('Authored Book \(Verfasser eines eigenst.ndigen Buches\)', 'Authored book', value)
+        value = re.sub('Book Item \(Buchkap\., Lexikonartikel, jur\. Kommentierung, Beiträge in Sammelbänden etc\.\)',
+                       'Book item', value)
+        value = re.sub('ConferencePaper \(Artikel, die in Tagungsb.nden erschienen sind\)', 'Conference paper', value)
+        value = re.sub('Edited Book \(Herausgeber eines eigenst.ndigen Buches\)', 'Edited book', value)
+        value = re.sub('JournalArticle \(Originalarbeit in einer wissenschaftlichen Zeitschrift\)', 'Journal article', value)
+
+        # Note: 'JournalItem' lacks the leading 'Publication: ' and the closing parenthesis.
+        value = re.sub('JournalItem \(Kommentare, Editorials, Rezensionen, Urteilsanmerk\., etc\. in einer wissensch\. Zeitschr\.',
+                       'Publication type according to Uni Basel Research Database: Journal item', value)
+        value = re.sub('NewsItemEmission \(Radio - Fernsehbeitr.ge\)', 'News item emission', value)
+        value = re.sub('NewsItemPrint \(Artikel in einer Tages, Wochen- oder Monatszeitschrift\)', 'News item print', value)
+        value = re.sub('Other Publications \(Forschungsberichte o\. .\.\)', 'Other publications', value)
+
+        ET.SubElement(parent, 'note').text = value
+
+    @staticmethod
+    def transform_creators(element, parent):
+        """Transform the creators list into given / family name pairs."""
+        # TODO: Add clean up routines.
+        creators = ET.SubElement(parent, 'creator')
+        names = element.text.split(';')
+
+        for name in names:
+            family, given = name.split(',')
+            item = ET.SubElement(creators, 'item')
+            ET.SubElement(item, 'family').text = family.strip()
+            ET.SubElement(item, 'given').text = given.strip()
+
+
+
 
 
 
