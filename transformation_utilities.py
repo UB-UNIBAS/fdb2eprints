@@ -9,6 +9,9 @@ import collections
 import html
 import os
 import re
+import json
+
+import requests
 
 from csv import DictReader
 from configparser import ConfigParser
@@ -550,15 +553,35 @@ class TransformFDBRecord(collections.Sequence):
                 ET.SubElement(item, 'family').text = family.strip()
                 ET.SubElement(item, 'given').text = given.strip()
 
-    @staticmethod
-    def transform_id_number(element, parent, type_tag):
+    def transform_id_number(self, element, parent, type_tag):
         """Transform an id number (doi, isi, pubmed)."""
-        text = element.text
+        text = element.text.strip()
         # remove all prefixes:
         text = re.sub('^.*:', '', text)
+        text = re.sub('http://dx\.doi\.org/', '', text)
+        text = text.strip()
 
         # TODO: implement duplicate check
         # TODO: implement check if id_number is valid
+
+        if type_tag == 'doi':
+            try:
+                response = requests.get('https://doi.org/api/handles/' + text)
+            except Exception as error:
+                self.logger.error('Could not access doi resolver, because %s.', str(error))
+            else:
+                response_code = json.loads(response.text)['responseCode']
+                if response_code == 1:
+                    self.logger.info('DOI Found.')
+                elif response_code == 2:
+                    self.logger.error('Something unexpected went wrong during handle resolution. '
+                                      '(HTTP 500 Internal Server Error).')
+                elif response_code == 100:
+                    self.logger.error('Handle %s not found for record %s.', element.text, self.current_id)
+                elif response_code == 200:
+                    self.logger.warning('Values Not Found. The handle %s exists but has no values (or no values '
+                                        'according to the types and indices specified). (HTTP 200 OK) for record %s.',
+                                        element.text, self.current_id)
 
         id_number = parent.find('./id_number')
         if id_number is None:

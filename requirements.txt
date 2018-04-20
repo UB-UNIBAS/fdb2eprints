@@ -1,2 +1,3 @@
 simple-elastic
 rdb-basel-harvester
+requests
