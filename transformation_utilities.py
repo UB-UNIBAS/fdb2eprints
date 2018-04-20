@@ -10,6 +10,7 @@ import html
 import os
 import re
 
+from csv import DictReader
 from configparser import ConfigParser
 
 
@@ -25,6 +26,7 @@ class TransformFDBRecord(collections.Sequence):
                  import_filter: dict,
                  ignore_list: set,
                  target_path: str,
+                 organisation_file = 'data/organisation.csv',
                  logger=logging.getLogger(__name__.split('.')[-1])):
 
         self.record_type = record_type
@@ -34,11 +36,21 @@ class TransformFDBRecord(collections.Sequence):
         self.target_path = target_path
         self.functions = None
         self.ignore_list = ignore_list
+        self.static_fields = {}
         self.logger = logger
         self.current_id = ''
         self.current_title = ''
         self.current_type = ''
         self.current_subtype = ''
+        self.month_day = ''
+
+        self.full_text_logger = logging.getLogger('fulltext')
+        self.full_text_logger.setLevel(logging.INFO)
+
+        file_handler = logging.FileHandler('edoc-rdb-fulltext.txt')
+        formatter = logging.Formatter('%(message)s')
+        file_handler.setFormatter(formatter)
+        self.full_text_logger.addHandler(file_handler)
 
 
         self.publication_types = {
@@ -54,6 +66,21 @@ class TransformFDBRecord(collections.Sequence):
             'Publication: NewsItemEmission (Radio - Fernsehbeiträge)': 'audio_visual',
             'Publication: Thesis (Dissertationen, Habilitationen)': 'thesis'
         }
+
+        with open(organisation_file, 'r') as csvfile:
+            organisation = DictReader(csvfile)
+            all_organisations = list()
+            for row in organisation:
+                all_organisations.append(row)
+
+        self.departments = dict()
+        for row in all_organisations:
+            departement_name = ''
+            parent_id = row['parent_mcssid'].split(',')[0]
+            for second_row in all_organisations:
+                if parent_id == second_row['mcssid']:
+                    departement_name = second_row['name']
+            self.departments[row['mcssid']] = departement_name
 
     def harvest(self, use_last_update=False):
         harvester = HarvestFDBData(user=config['fdb-harvest']['user'],
@@ -125,6 +152,10 @@ class TransformFDBRecord(collections.Sequence):
                         self.current_type = element.text
                     elif element.tag == 'pubtype_weboffice':
                         self.current_subtype = element.text
+                    elif element.tag == 'month_day':
+                        self.month_day = element.text
+                for field in self.static_fields:
+                    ET.SubElement(c, field).text = self.static_fields[field]
                 for element in fields:
                     if element.tag in self.functions:
                         self.functions[element.tag][0](element, c, **self.functions[element.tag][1])
@@ -180,7 +211,7 @@ class TransformFDBRecord(collections.Sequence):
             else:
                 logging.debug('Ignoring the following field in person element: %s', element.tag)
 
-    def transform_persons(self, element, parent, edoc_tag):
+    def transform_persons(self, element, parent, edoc_tag, type=''):
         """Transform a unibas contributor."""
         person = parent.find('./' + edoc_tag)
         if person is None:
@@ -198,6 +229,9 @@ class TransformFDBRecord(collections.Sequence):
                 self.transform_to_field(item, eprint_item, 'unibasChPublicId')
             else:
                 self.transform_name(item, name_item)
+
+        if type != '':
+            ET.SubElement(eprint_item, 'type').text = type
 
     def transform_submitters(self, element, parent, edoc_tag):
         """Same as person, but ignored unibasCHpublicId, DNI and ORCID."""
@@ -395,7 +429,7 @@ class TransformFDBRecord(collections.Sequence):
             element.text = element.text.strip('.')
         self.transform_html_text(element, parent, edoc_tag)
 
-    def transform_page_range(self, element, parent, edoc_tag):
+    def transform_page_range(self, element, parent):
         """Transform publication page ranges.
 
         Removes common prefixes & whitespaces.
@@ -403,56 +437,65 @@ class TransformFDBRecord(collections.Sequence):
         pages = element.text.strip()
         pages = re.sub('^S\. ', '', pages)
         pages = re.sub('^p\. ', '', pages)
-        if self.current_type in []
-        page_range = element.text
-        if page_range.count('-') == 1:
-            f, s = page_range.split('-')
-            try:
-                first_number = int(f)
-                second_number = int(s)
-            except ValueError:
-                pass
-            else:
-                new_second = ''
-                if second_number < first_number:
-                    for i in range(len(f) - len(s)):
-                        new_second += str(f[i])
-                    page_range = str(f) + '-' + new_second + str(s)
+        if self.publication_types[self.current_type] in ['book', 'thesis', 'working_paper']:
+            ET.SubElement(parent, 'pages').text = pages
+        else:
+            page_range = pages
+            if page_range.count('-') == 1:
+                f, s = page_range.split('-')
+                try:
+                    first_number = int(f)
+                    second_number = int(s)
+                except ValueError:
+                    pass
+                else:
+                    new_second = ''
+                    if second_number < first_number:
+                        for i in range(len(f) - len(s)):
+                            new_second += str(f[i])
+                        page_range = str(f) + '-' + new_second + str(s)
+            ET.SubElement(parent, 'pagerange').text = page_range
 
-        ET.SubElement(parent, edoc_tag).text = page_range
-
-    def transform_publication_type(self, element, parent, edoc_tag):
+    def _create_publication_type(self, parent):
         """Transform the publication type.
 
         Creates the note as well.
         """
-        self.create_note_from_type(element.text, parent)
-        value = element.text
+        pub_type = ET.Element('type')
+        pub_type.text = self.current_type
+        self._create_note_from_type(pub_type, parent)
 
-        if re.search('Authored Book|Edited Book', value):
-            element.text = 'book'
-        elif re.search('JournalArticle|JournalItem', value):
-            element.text = 'article'
-        elif re.search('Book Item', value):
-            element.text = 'book section'
-        elif re.search('ConferencePaper', value):
-            element.text = 'conference_item'
-        elif re.search('Thesis', value):
-            element.text = 'thesis'
+        result = self.publication_types[self.current_type]
+
         # Note: Only discussion papers with the subtype internet publication become type preprint.
-        elif re.search('Discussion paper', value) and self.current_subtype == 'Internet publication':
-            element.text = 'preprint'
-        elif re.search('Discussion paper', value):
-            element.text = 'working_paper'
-        elif re.search('NewsItemPrint', value):
-            element.text = 'contribution_to_peridocal'
-        elif re.search('NewsItemEmission', value):
-            element.text = 'audio_visual'
+        if result == 'working_paper' and self.current_subtype == 'Internet publication':
+            result = 'preprint'
 
-        self.transform_to_field(element, parent, edoc_tag)
+        ET.SubElement(parent, 'type').text = result
+        return result
+
+    def _create_note_from_type(self, element, parent):
+        """Generate the note from the RDB type."""
+        value = re.sub('Publication: ', 'Publication type according to Uni Basel Research Database: ', element.text)
+
+        value = re.sub('Authored Book \(Verfasser eines eigenst.ndigen Buches\)', 'Authored book', value)
+        value = re.sub('Book Item \(Buchkap\., Lexikonartikel, jur\. Kommentierung, Beiträge in Sammelbänden etc\.\)',
+                       'Book item', value)
+        value = re.sub('ConferencePaper \(Artikel, die in Tagungsb.nden erschienen sind\)', 'Conference paper', value)
+        value = re.sub('Edited Book \(Herausgeber eines eigenst.ndigen Buches\)', 'Edited book', value)
+        value = re.sub('JournalArticle \(Originalarbeit in einer wissenschaftlichen Zeitschrift\)', 'Journal article', value)
+
+        # Note: 'JournalItem' lacks the leading 'Publication: ' and the closing parenthesis.
+        value = re.sub('JournalItem \(Kommentare, Editorials, Rezensionen, Urteilsanmerk\., etc\. in einer wissensch\. Zeitschr\.',
+                       'Publication type according to Uni Basel Research Database: Journal item', value)
+        value = re.sub('NewsItemEmission \(Radio - Fernsehbeitr.ge\)', 'News item emission', value)
+        value = re.sub('NewsItemPrint \(Artikel in einer Tages, Wochen- oder Monatszeitschrift\)', 'News item print', value)
+        value = re.sub('Other Publications \(Forschungsberichte o\. ä\.\)', 'Other publications', value)
+        element.text = value
+        self.append_to_field(element, parent, 'note', separator=' -- ')
 
     def transform_pubtype_weboffice(self, element, parent, edoc_tag):
-        """
+        """Transforms the pubtype weboffice to a subtype where possible.
         """
 
         subtypes = {
@@ -486,28 +529,9 @@ class TransformFDBRecord(collections.Sequence):
             self.logger.error('Could not determine subtype of %s with type %s and subtype %s.', self.current_id,
                               self.current_type, self.current_subtype)
 
-        ET.SubElement(parent, edoc_tag).text = text
+        pub_type = self._create_publication_type(parent)
 
-    @staticmethod
-    def create_note_from_type(value, parent):
-        """Generate the note from the RDB type."""
-        value = re.sub('Publication: ', 'Publication type according to Uni Basel Research Database: ', value)
-
-        value = re.sub('Authored Book \(Verfasser eines eigenst.ndigen Buches\)', 'Authored book', value)
-        value = re.sub('Book Item \(Buchkap\., Lexikonartikel, jur\. Kommentierung, Beiträge in Sammelbänden etc\.\)',
-                       'Book item', value)
-        value = re.sub('ConferencePaper \(Artikel, die in Tagungsb.nden erschienen sind\)', 'Conference paper', value)
-        value = re.sub('Edited Book \(Herausgeber eines eigenst.ndigen Buches\)', 'Edited book', value)
-        value = re.sub('JournalArticle \(Originalarbeit in einer wissenschaftlichen Zeitschrift\)', 'Journal article', value)
-
-        # Note: 'JournalItem' lacks the leading 'Publication: ' and the closing parenthesis.
-        value = re.sub('JournalItem \(Kommentare, Editorials, Rezensionen, Urteilsanmerk\., etc\. in einer wissensch\. Zeitschr\.',
-                       'Publication type according to Uni Basel Research Database: Journal item', value)
-        value = re.sub('NewsItemEmission \(Radio - Fernsehbeitr.ge\)', 'News item emission', value)
-        value = re.sub('NewsItemPrint \(Artikel in einer Tages, Wochen- oder Monatszeitschrift\)', 'News item print', value)
-        value = re.sub('Other Publications \(Forschungsberichte o\. .\.\)', 'Other publications', value)
-
-        ET.SubElement(parent, 'note').text = value
+        ET.SubElement(parent, pub_type + edoc_tag).text = text
 
     @staticmethod
     def transform_creators(element, parent):
@@ -517,10 +541,95 @@ class TransformFDBRecord(collections.Sequence):
         names = element.text.split(';')
 
         for name in names:
-            family, given = name.split(',')
-            item = ET.SubElement(creators, 'item')
-            ET.SubElement(item, 'family').text = family.strip()
-            ET.SubElement(item, 'given').text = given.strip()
+            try:
+                family, given = name.split(',')
+            except ValueError:
+                logging.error('Could not split the following name: %s.', name)
+            else:
+                item = ET.SubElement(creators, 'item')
+                ET.SubElement(item, 'family').text = family.strip()
+                ET.SubElement(item, 'given').text = given.strip()
+
+    @staticmethod
+    def transform_id_number(element, parent, type_tag):
+        """Transform an id number (doi, isi, pubmed)."""
+        text = element.text
+        # remove all prefixes:
+        text = re.sub('^.*:', '', text)
+
+        # TODO: implement duplicate check
+        # TODO: implement check if id_number is valid
+
+        id_number = parent.find('./id_number')
+        if id_number is None:
+            id_number = ET.SubElement(parent, 'id_number')
+        item = ET.SubElement(id_number, 'item')
+        ET.SubElement(item, 'type').text = type_tag
+        ET.SubElement(item, 'id').text = text
+
+    @staticmethod
+    def append_to_field(element, parent, edoc_tag, prefix='', suffix='', separator=' '):
+        """Append text to a field with a optional prefix/suffix value. Default separator is a single space."""
+        field = parent.find('./' + edoc_tag)
+        if field is None:
+            field = ET.SubElement(parent, edoc_tag)
+        previous_text = field.text
+        if previous_text is not None:
+            field.text = previous_text + separator + prefix + element.text + suffix
+        else:
+            field.text = prefix + element.text + suffix
+        field.text = field.text.strip()
+
+    def transform_edition(self, element, parent, edoc_tag):
+        """Transform the edition field of publications."""
+        pub_type = self.publication_types[self.current_type]
+        if pub_type in ['book', 'book_section']:
+            self.transform_to_field(element, parent, edoc_tag)
+        else:
+            self.append_to_field(element, parent, 'note', prefix='Edition: ', separator=' -- ')
+
+    def log_fulltext_url(self, element, parent):
+        """Prints the the fulltext urls for import with fulltext import script."""
+        self.full_text_logger.info('%s|%s', self.current_id, element.text)
+
+    def transform_date(self, element, parent, edoc_tag):
+        """Tansform publication date from two elements. dc:date + fdb:month_day."""
+        ET.SubElement(parent, edoc_tag).text = element.text + '-' + self.month_day if self.month_day != '' else element.text
+
+    def transform_issn_isbn(self, element, parent):
+        """Transforms the value from the issn_isbn field to either issn or isbn."""
+        text = element.text.strip()
+        if re.match('\d{4}-\d{3}[0-9xX]', text):
+            ET.SubElement(parent, 'issn').text = text
+        else:
+            ET.SubElement(parent, 'isbn').text = text
+
+    def transform_with_dict(self, element, parent, edoc_tag, transformation_values):
+        """Transforms the values with the transformation values given."""
+        ET.SubElement(parent, edoc_tag).text = transformation_values[element.text]
+
+    def transform_related_url(self, element, parent, edoc_tag, url_type):
+        """Transforms a related url."""
+        field = parent.find('./' + edoc_tag)
+        if field is None:
+            field = ET.SubElement(parent, edoc_tag)
+        item = ET.SubElement(field, 'item')
+        ET.SubElement(item, 'type').text = url_type
+
+        if not re.search('^http[s]?://', element.text):
+            self.logger.warning('URL is missing protocol-prefix %s for publication %s.', element.text, self.current_id)
+
+        ET.SubElement(item, 'url').text = element.text
+
+    def transform_mcssorgid(self, element, parent, edoc_tag):
+        """Transform mcss org id to divisions and add department."""
+        if parent.find('./department') is None:
+            try:
+                ET.SubElement(parent, 'department').text = self.departments[element.text]
+            except KeyError:
+                self.logger.error('Could not match mcssorgid %s for in publication %s.', element.text, self.current_id)
+        self.transform_to_list(element, parent, edoc_tag)
+
 
 
 
