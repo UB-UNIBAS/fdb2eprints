@@ -558,7 +558,7 @@ class TransformFDBRecord(collections.Sequence):
         text = element.text.strip()
         # remove all prefixes:
         text = re.sub('^.*:', '', text)
-        text = re.sub('http://dx\.doi\.org/', '', text)
+        text = re.sub('http:\/\/dx\.doi\.org\/', '', text)
         text = text.strip()
 
         # TODO: implement duplicate check
@@ -582,6 +582,22 @@ class TransformFDBRecord(collections.Sequence):
                     self.logger.warning('Values Not Found. The handle %s exists but has no values (or no values '
                                         'according to the types and indices specified). (HTTP 200 OK) for record %s.',
                                         element.text, self.current_id)
+
+        if type_tag == 'pmid':
+            try:
+                response = requests.get('https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids=' + text +
+                                        '&format=json')
+            except Exception as error:
+                self.logger.error('Could not access PubMed Converter, because %s.', str(error))
+            else:
+                response = json.loads(response.text)
+                if response['status'] == 'ok':
+                    record = response['records'][0]
+                    if 'status' in record and record['status'] == 'error':
+                        self.logger.error(record['errmsg'])
+                    elif 'doi' in record:
+                        self.logger.info('Found DOI')
+                        # TODO: find a good way to append this data if not already there.
 
         id_number = parent.find('./id_number')
         if id_number is None:
